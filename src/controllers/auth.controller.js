@@ -1,4 +1,4 @@
-// src/controllers/auth.controller.js - Controlador de autenticación
+// src/controllers/auth.controller.js - Controlador de autenticación CON DEBUG
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
@@ -119,10 +119,22 @@ export const authController = {
 
   // Login de usuario
   login: async (req, res) => {
+    // ✅ DEBUG: Log para ver si llega al controlador
+    console.log('🔍 LOGIN REQUEST RECEIVED:', {
+      body: req.body,
+      hasEmail: !!req.body?.email,
+      hasPassword: !!req.body?.password,
+      url: req.url,
+      method: req.method
+    });
+    
     try {
+      console.log('🔍 Starting login validation...');
+      
       // Validar datos de entrada
       const validationResult = loginSchema.safeParse(req.body);
       if (!validationResult.success) {
+        console.log('❌ Validation failed:', validationResult.error.errors);
         return res.status(400).json({
           success: false,
           error: 'Datos inválidos',
@@ -131,6 +143,7 @@ export const authController = {
       }
 
       const { email, password } = validationResult.data;
+      console.log('✅ Validation passed, searching user:', email);
 
       // Buscar usuario por email
       const user = await prisma.user.findUnique({
@@ -148,7 +161,15 @@ export const authController = {
         }
       });
 
+      console.log('🔍 User found:', {
+        found: !!user,
+        email: user?.email,
+        isActive: user?.isActive,
+        hasPassword: !!user?.password
+      });
+
       if (!user) {
+        console.log('❌ User not found');
         return res.status(401).json({
           success: false,
           error: 'Credenciales inválidas'
@@ -157,21 +178,28 @@ export const authController = {
 
       // Verificar si el usuario está activo
       if (!user.isActive) {
+        console.log('❌ User not active');
         return res.status(401).json({
           success: false,
           error: 'Cuenta desactivada. Contacta al administrador.'
         });
       }
 
+      console.log('🔍 Comparing passwords...');
       // Verificar contraseña
       const isValidPassword = await bcrypt.compare(password, user.password);
+      console.log('🔍 Password valid:', isValidPassword);
+      
       if (!isValidPassword) {
+        console.log('❌ Invalid password');
         return res.status(401).json({
           success: false,
           error: 'Credenciales inválidas'
         });
       }
 
+      console.log('✅ Login successful, updating lastLogin...');
+      
       // Actualizar último login
       await prisma.user.update({
         where: { id: user.id },
@@ -182,6 +210,7 @@ export const authController = {
       const token = generateToken(user.id);
 
       logger.info(`Usuario logueado: ${email}`);
+      console.log('✅ Token generated, sending response');
 
       res.json({
         success: true,
@@ -193,6 +222,7 @@ export const authController = {
       });
 
     } catch (error) {
+      console.log('❌ Login error:', error);
       logger.error('Error en login:', error);
       res.status(500).json({
         success: false,
