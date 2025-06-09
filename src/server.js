@@ -1,4 +1,4 @@
-// src/server.js - Servidor principal
+// src/server.js - Servidor principal CORREGIDO
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -33,6 +33,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ===============================
+// CONFIGURACIÓN PARA PROXY
+// ===============================
+
+// ✅ CRÍTICO: Configurar trust proxy para Render
+app.set('trust proxy', 1);
+
+// ===============================
 // MIDDLEWARES DE SEGURIDAD
 // ===============================
 
@@ -49,22 +56,29 @@ app.use(helmet({
   },
 }));
 
-// Rate limiting
+// Rate limiting MEJORADO
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 minutos
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100, // límite por IP
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 200, // ✅ Aumentado de 100 a 200
   message: {
+    success: false,
     error: 'Demasiadas solicitudes desde esta IP, intenta de nuevo más tarde.',
     retryAfter: '15 minutos'
   },
   standardHeaders: true,
   legacyHeaders: false,
+  // ✅ Skip rate limiting para health checks
+  skip: (req) => {
+    return req.url === '/health' || req.url === '/';
+  }
 });
 
+// ✅ Solo aplicar rate limiting a rutas de API
 app.use('/api/', limiter);
 
-// CORS configurado
+// CORS configurado MEJORADO
 const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
+  'https://clinic-saas-frontend.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000'
 ];
@@ -77,6 +91,7 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
       return callback(null, true);
     } else {
+      logger.warn(`CORS blocked for origin: ${origin}`);
       return callback(new Error('No permitido por CORS'));
     }
   },
@@ -96,12 +111,14 @@ app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Logging
+// Logging MEJORADO
 if (process.env.NODE_ENV === 'production') {
   app.use(morgan('combined', {
     stream: {
       write: (message) => logger.info(message.trim())
-    }
+    },
+    // ✅ Skip logging para health checks frecuentes
+    skip: (req) => req.url === '/health'
   }));
 } else {
   app.use(morgan('dev'));
@@ -120,14 +137,25 @@ app.use((req, res, next) => {
 // RUTAS
 // ===============================
 
-// Health check
+// Health check MEJORADO
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV,
-    version: process.env.npm_package_version || '1.0.0'
+    version: process.env.npm_package_version || '1.0.0',
+    database: 'connected' // Se podría hacer un check real aquí
+  });
+});
+
+// Ruta raíz
+app.get('/', (req, res) => {
+  res.status(200).json({
+    message: 'Clinic Backend API',
+    version: '1.0.0',
+    status: 'active',
+    documentation: '/health'
   });
 });
 
@@ -152,8 +180,36 @@ app.use('/uploads', express.static('uploads'));
 // 404 handler
 app.use(notFoundHandler);
 
-// Error handler global
-app.use(errorHandler);
+// Error handler global MEJORADO
+app.use((error, req, res, next) => {
+  // Log del error
+  logger.error(`Error: ${error.message}`, {
+    url: req.url,
+    method: req.method,
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+    userId: req.user?.id || null
+  });
+
+  // Error de CORS
+  if (error.message === 'No permitido por CORS') {
+    return res.status(403).json({
+      success: false,
+      error: 'CORS: Origin no permitido'
+    });
+  }
+
+  // Error de rate limiting
+  if (error.status === 429) {
+    return res.status(429).json({
+      success: false,
+      error: 'Demasiadas solicitudes'
+    });
+  }
+
+  // Error genérico
+  return errorHandler(error, req, res, next);
+});
 
 // ===============================
 // INICIO DEL SERVIDOR
@@ -177,6 +233,7 @@ const startServer = async () => {
       logger.info(`🚀 Servidor ejecutándose en puerto ${PORT}`);
       logger.info(`🌍 Entorno: ${process.env.NODE_ENV}`);
       logger.info(`📊 Health check: http://localhost:${PORT}/health`);
+      logger.info(`🔗 Allowed origins: ${allowedOrigins.join(', ')}`);
       
       if (process.env.NODE_ENV === 'development') {
         logger.info(`📚 API Docs: http://localhost:${PORT}/api`);
