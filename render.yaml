@@ -1,0 +1,87 @@
+# render.yaml - Configuración para deployment en Render
+services:
+  # Servicio principal de API
+  - type: web
+    name: clinic-api
+    runtime: node
+    plan: starter # Cambiar a 'standard' para producción
+    region: oregon # o 'singapore' para latencia en Asia
+    branch: main
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    
+    # Variables de entorno
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: JWT_SECRET
+        generateValue: true # Render genera automáticamente
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: FRONTEND_URL
+        value: https://your-frontend-app.onrender.com
+      - key: ALLOWED_ORIGINS
+        value: https://your-frontend-app.onrender.com,https://clinic-api.onrender.com
+      - key: RATE_LIMIT_WINDOW_MS
+        value: 900000
+      - key: RATE_LIMIT_MAX_REQUESTS
+        value: 100
+      - key: VIP_MONTHLY_PRICE
+        value: 1500
+      - key: VIP_ANNUAL_PRICE
+        value: 12000
+      - key: VIP_DISCOUNT_PERCENTAGE
+        value: 25
+      - key: LOG_LEVEL
+        value: info
+      # Email configuration (usar variables de entorno secretas)
+      - key: EMAIL_HOST
+        value: smtp.gmail.com
+      - key: EMAIL_PORT
+        value: 587
+      - key: EMAIL_USER
+        sync: false # Variable secreta
+      - key: EMAIL_PASSWORD
+        sync: false # Variable secreta
+      - key: EMAIL_FROM
+        value: Clínica Estética <noreply@clinica.com>
+      # SMS configuration (variables secretas)
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+    
+    # Health check
+    healthCheckPath: /health
+    
+    # Configuración de recursos
+    disk:
+      name: clinic-disk
+      mountPath: /opt/render/project/src/uploads
+      sizeGB: 1
+
+  # Base de datos PostgreSQL
+  - type: pgsql
+    name: clinic-db
+    plan: starter # Cambiar a 'standard' para producción
+    region: oregon
+    databaseName: clinic_production
+    user: clinic_user
+    
+    # Scripts de inicialización
+    postgresMajorVersion: 15
+
+# Configuración adicional
+databases:
+  - name: clinic-db
+    databaseName: clinic_production
+    user: clinic_user
+    plan: starter
+    region: oregon
+
+# Variables de entorno que Render manejará automáticamente:
+# DATABASE_URL - Se genera automáticamente al conectar el servicio con la DB

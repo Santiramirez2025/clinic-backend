@@ -1,0 +1,278 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Enums
+enum UserRole {
+  ADMIN
+  STAFF
+  CLIENTE
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum NotificationType {
+  APPOINTMENT_REMINDER
+  APPOINTMENT_CONFIRMATION
+  VIP_PROMOTION
+  GENERAL
+  SYSTEM
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  PENDING
+}
+
+// Modelos principales
+model User {
+  id          String   @id @default(uuid())
+  email       String   @unique
+  password    String
+  name        String
+  phone       String?
+  avatar      String?
+  role        UserRole @default(CLIENTE)
+  isActive    Boolean  @default(true)
+  bio         String?
+  birthday    DateTime?
+  location    String?
+  
+  // Relaciones con clínica
+  clinicId    String?
+  clinic      Clinic?  @relation(fields: [clinicId], references: [id])
+  
+  // VIP Status
+  isVIP       Boolean  @default(false)
+  vipExpiry   DateTime?
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  lastLogin   DateTime?
+  
+  // Relaciones
+  appointments     Appointment[]
+  notifications    Notification[]
+  vipSubscriptions VipSubscription[]
+  
+  @@map("users")
+}
+
+model Clinic {
+  id             String  @id @default(uuid())
+  name           String
+  description    String?
+  address        String
+  phone          String
+  email          String
+  website        String?
+  logo           String?
+  primaryColor   String  @default("#6366f1")
+  secondaryColor String  @default("#8b5cf6")
+  
+  // Configuraciones
+  timezone       String  @default("America/Argentina/Buenos_Aires")
+  currency       String  @default("ARS")
+  isActive       Boolean @default(true)
+  
+  // Horarios de atención
+  openTime       String  @default("09:00")
+  closeTime      String  @default("18:00")
+  workingDays    String  @default("1,2,3,4,5") // 1=Monday, 7=Sunday
+  
+  // Timestamps
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  
+  // Relaciones
+  users          User[]
+  services       Service[]
+  appointments   Appointment[]
+  tips           Tip[]
+  notifications  Notification[]
+  
+  @@map("clinics")
+}
+
+model Service {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+  duration    Int     // minutos
+  price       Float
+  category    String?
+  isActive    Boolean @default(true)
+  isVipOnly   Boolean @default(false)
+  
+  // Configuración VIP
+  vipDiscount Float   @default(0.0) // porcentaje de descuento para VIP
+  
+  // Relación con clínica
+  clinicId    String
+  clinic      Clinic  @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relaciones
+  appointments Appointment[]
+  
+  @@map("services")
+}
+
+model Appointment {
+  id          String            @id @default(uuid())
+  date        DateTime
+  time        String
+  status      AppointmentStatus @default(SCHEDULED)
+  notes       String?
+  
+  // Precios
+  originalPrice Float?
+  finalPrice    Float?
+  vipDiscount   Float?  @default(0.0)
+  
+  // Relaciones
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  serviceId   String
+  service     Service  @relation(fields: [serviceId], references: [id])
+  
+  clinicId    String
+  clinic      Clinic   @relation(fields: [clinicId], references: [id])
+  
+  // Control de cancelación
+  cancelledAt DateTime?
+  cancelReason String?
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relaciones
+  notifications Notification[]
+  
+  @@map("appointments")
+}
+
+model Tip {
+  id        String   @id @default(uuid())
+  title     String
+  content   String
+  category  String?
+  isActive  Boolean  @default(true)
+  
+  // Targeteo
+  isVipOnly Boolean  @default(false)
+  
+  // Relación con clínica
+  clinicId  String
+  clinic    Clinic   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("tips")
+}
+
+model Notification {
+  id          String           @id @default(uuid())
+  title       String
+  message     String
+  type        NotificationType
+  isRead      Boolean          @default(false)
+  
+  // Canales de envío
+  sentEmail   Boolean          @default(false)
+  sentSms     Boolean          @default(false)
+  sentPush    Boolean          @default(false)
+  
+  // Relaciones
+  userId      String
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  clinicId    String
+  clinic      Clinic           @relation(fields: [clinicId], references: [id])
+  
+  // Opcional: relación con cita
+  appointmentId String?
+  appointment   Appointment?   @relation(fields: [appointmentId], references: [id])
+  
+  // Timestamps
+  createdAt   DateTime         @default(now())
+  readAt      DateTime?
+  
+  @@map("notifications")
+}
+
+model VipSubscription {
+  id          String             @id @default(uuid())
+  status      SubscriptionStatus @default(PENDING)
+  
+  // Período de suscripción
+  startDate   DateTime
+  endDate     DateTime
+  
+  // Pricing
+  planType    String            // "monthly", "annual"
+  price       Float
+  discount    Float             @default(0.0)
+  
+  // Relación con usuario
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  cancelledAt DateTime?
+  
+  @@map("vip_subscriptions")
+}
+
+// Modelo para configuraciones globales
+model AppConfig {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String
+  description String?
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@map("app_config")
+}
+
+// Modelo para logs del sistema
+model SystemLog {
+  id        String   @id @default(uuid())
+  level     String   // "info", "warn", "error"
+  message   String
+  context   Json?    // Datos adicionales en formato JSON
+  userId    String?
+  
+  createdAt DateTime @default(now())
+  
+  @@map("system_logs")
+}
