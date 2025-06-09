@@ -21,6 +21,7 @@ import appointmentRoutes from './routes/appointment.routes.js';
 import notificationRoutes from './routes/notification.routes.js';
 import vipRoutes from './routes/vip.routes.js';
 import tipRoutes from './routes/tip.routes.js';
+import initRoutes from './routes/init.routes.js';
 
 // Importar servicios
 import { startCronJobs } from './services/cronService.js';
@@ -139,6 +140,7 @@ app.use('/api/appointments', appointmentRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/vip', vipRoutes);
 app.use('/api/tips', tipRoutes);
+app.use('/api/init', initRoutes);
 
 // Servir archivos estáticos
 app.use('/uploads', express.static('uploads'));
