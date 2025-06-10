@@ -4,7 +4,7 @@ import { appointmentController } from '../controllers/appointment.controller.js'
 
 const router = express.Router();
 
-// Rutas de citas
+// Rutas existentes (las tuyas están bien)
 router.post('/', authenticateToken, appointmentController.create);
 router.get('/', authenticateToken, appointmentController.getUserAppointments);
 router.get('/all', authenticateToken, requireStaff, appointmentController.getAll);
@@ -15,5 +15,11 @@ router.put('/:id', authenticateToken, appointmentController.update);
 router.delete('/:id', authenticateToken, appointmentController.cancel);
 router.post('/:id/confirm', authenticateToken, requireStaff, appointmentController.confirm);
 router.post('/:id/complete', authenticateToken, requireStaff, appointmentController.complete);
+
+// ✅ AGREGAR ESTAS 4 LÍNEAS NUEVAS:
+router.post('/:id/reminder', authenticateToken, appointmentController.sendReminder);
+router.get('/search', authenticateToken, appointmentController.search);
+router.post('/:id/reschedule', authenticateToken, appointmentController.reschedule);
+router.post('/check-availability', authenticateToken, appointmentController.checkAvailability);
 
 export default router;
