@@ -1,4 +1,4 @@
-// src/controllers/auth.controller.js - Controlador de autenticación CON DEBUG
+// src/controllers/auth.controller.js - Controlador de autenticación optimizado
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
@@ -7,30 +7,87 @@ import { registerSchema, loginSchema } from '../validators/auth.validators.js';
 
 const prisma = new PrismaClient();
 
-// Generar JWT token
-const generateToken = (userId) => {
-  return jwt.sign(
-    { userId },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-  );
+// Pre-compilar configuración JWT
+const JWT_CONFIG = {
+  secret: process.env.JWT_SECRET,
+  expiresIn: process.env.JWT_EXPIRES_IN || '7d'
 };
 
-// Formatear respuesta de usuario
+// Configuración de bcrypt
+const BCRYPT_ROUNDS = 12;
+
+// Selects optimizados para queries frecuentes
+const USER_BASE_SELECT = {
+  id: true,
+  email: true,
+  name: true,
+  phone: true,
+  role: true,
+  clinicId: true,
+  isActive: true,
+  bio: true,
+  birthday: true,
+  location: true,
+  lastLogin: true,
+  createdAt: true,
+  updatedAt: true
+};
+
+const USER_WITH_RELATIONS_INCLUDE = {
+  clinic: {
+    select: {
+      id: true,
+      name: true,
+      address: true,
+      phone: true
+    }
+  },
+  vipSubscriptions: {
+    where: {
+      status: 'ACTIVE',
+      endDate: { gte: new Date() }
+    },
+    select: {
+      id: true,
+      status: true,
+      endDate: true,
+      planType: true
+    },
+    orderBy: { endDate: 'desc' },
+    take: 1
+  }
+};
+
+// Generar JWT token
+const generateToken = (userId) => {
+  return jwt.sign({ userId }, JWT_CONFIG.secret, { expiresIn: JWT_CONFIG.expiresIn });
+};
+
+// Formatear respuesta de usuario optimizada
 const formatUserResponse = (user) => {
   const { password, ...userWithoutPassword } = user;
   return {
     ...userWithoutPassword,
-    isVIP: user.vipSubscriptions?.length > 0 || false,
+    isVIP: user.vipSubscriptions?.length > 0,
     vipExpiry: user.vipSubscriptions?.[0]?.endDate || null
   };
 };
 
+// Validar existencia de clínica (cache potencial)
+const validateClinic = async (clinicId) => {
+  if (!clinicId) return true;
+  
+  const clinic = await prisma.clinic.findUnique({
+    where: { id: clinicId },
+    select: { id: true }
+  });
+  
+  return !!clinic;
+};
+
 export const authController = {
-  // Registro de usuario
   register: async (req, res) => {
     try {
-      // Validar datos de entrada
       const validationResult = registerSchema.safeParse(req.body);
       if (!validationResult.success) {
         return res.status(400).json({
@@ -42,10 +99,14 @@ export const authController = {
 
       const { email, password, name, phone, clinicId, role = 'CLIENTE' } = validationResult.data;
 
-      // Verificar si el usuario ya existe
-      const existingUser = await prisma.user.findUnique({
-        where: { email }
-      });
+      // Verificaciones paralelas
+      const [existingUser, isValidClinic] = await Promise.all([
+        prisma.user.findUnique({
+          where: { email },
+          select: { id: true }
+        }),
+        validateClinic(clinicId)
+      ]);
 
       if (existingUser) {
         return res.status(409).json({
@@ -54,25 +115,15 @@ export const authController = {
         });
       }
 
-      // Verificar si la clínica existe (si se proporciona)
-      if (clinicId) {
-        const clinic = await prisma.clinic.findUnique({
-          where: { id: clinicId }
+      if (!isValidClinic) {
+        return res.status(400).json({
+          success: false,
+          error: 'Clínica no encontrada'
         });
-
-        if (!clinic) {
-          return res.status(400).json({
-            success: false,
-            error: 'Clínica no encontrada'
-          });
-        }
       }
 
-      // Hash de la contraseña
-      const saltRounds = 12;
-      const hashedPassword = await bcrypt.hash(password, saltRounds);
+      const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-      // Crear usuario
       const user = await prisma.user.create({
         data: {
           email,
@@ -83,20 +134,14 @@ export const authController = {
           clinicId,
           lastLogin: new Date()
         },
-        include: {
-          clinic: true,
-          vipSubscriptions: {
-            where: {
-              status: 'ACTIVE',
-              endDate: { gte: new Date() }
-            }
-          }
+        select: {
+          ...USER_BASE_SELECT,
+          clinic: USER_WITH_RELATIONS_INCLUDE.clinic,
+          vipSubscriptions: USER_WITH_RELATIONS_INCLUDE.vipSubscriptions
         }
       });
 
-      // Generar token
       const token = generateToken(user.id);
-
       logger.info(`Usuario registrado: ${email} (${role})`);
 
       res.status(201).json({
@@ -117,24 +162,10 @@ export const authController = {
     }
   },
 
-  // Login de usuario
   login: async (req, res) => {
-    // ✅ DEBUG: Log para ver si llega al controlador
-    console.log('🔍 LOGIN REQUEST RECEIVED:', {
-      body: req.body,
-      hasEmail: !!req.body?.email,
-      hasPassword: !!req.body?.password,
-      url: req.url,
-      method: req.method
-    });
-    
     try {
-      console.log('🔍 Starting login validation...');
-      
-      // Validar datos de entrada
       const validationResult = loginSchema.safeParse(req.body);
       if (!validationResult.success) {
-        console.log('❌ Validation failed:', validationResult.error.errors);
         return res.status(400).json({
           success: false,
           error: 'Datos inválidos',
@@ -143,74 +174,40 @@ export const authController = {
       }
 
       const { email, password } = validationResult.data;
-      console.log('✅ Validation passed, searching user:', email);
 
-      // Buscar usuario por email
       const user = await prisma.user.findUnique({
         where: { email },
-        include: {
-          clinic: true,
-          vipSubscriptions: {
-            where: {
-              status: 'ACTIVE',
-              endDate: { gte: new Date() }
-            },
-            orderBy: { endDate: 'desc' },
-            take: 1
-          }
+        select: {
+          ...USER_BASE_SELECT,
+          password: true,
+          clinic: USER_WITH_RELATIONS_INCLUDE.clinic,
+          vipSubscriptions: USER_WITH_RELATIONS_INCLUDE.vipSubscriptions
         }
       });
 
-      console.log('🔍 User found:', {
-        found: !!user,
-        email: user?.email,
-        isActive: user?.isActive,
-        hasPassword: !!user?.password
-      });
-
-      if (!user) {
-        console.log('❌ User not found');
+      if (!user || !user.isActive) {
         return res.status(401).json({
           success: false,
-          error: 'Credenciales inválidas'
+          error: user?.isActive === false ? 'Cuenta desactivada. Contacta al administrador.' : 'Credenciales inválidas'
         });
       }
 
-      // Verificar si el usuario está activo
-      if (!user.isActive) {
-        console.log('❌ User not active');
-        return res.status(401).json({
-          success: false,
-          error: 'Cuenta desactivada. Contacta al administrador.'
-        });
-      }
-
-      console.log('🔍 Comparing passwords...');
-      // Verificar contraseña
       const isValidPassword = await bcrypt.compare(password, user.password);
-      console.log('🔍 Password valid:', isValidPassword);
-      
       if (!isValidPassword) {
-        console.log('❌ Invalid password');
         return res.status(401).json({
           success: false,
           error: 'Credenciales inválidas'
         });
       }
 
-      console.log('✅ Login successful, updating lastLogin...');
-      
-      // Actualizar último login
-      await prisma.user.update({
+      // Actualización de lastLogin en paralelo (no blocking)
+      prisma.user.update({
         where: { id: user.id },
         data: { lastLogin: new Date() }
-      });
+      }).catch(err => logger.error('Error updating lastLogin:', err));
 
-      // Generar token
       const token = generateToken(user.id);
-
       logger.info(`Usuario logueado: ${email}`);
-      console.log('✅ Token generated, sending response');
 
       res.json({
         success: true,
@@ -222,7 +219,6 @@ export const authController = {
       });
 
     } catch (error) {
-      console.log('❌ Login error:', error);
       logger.error('Error en login:', error);
       res.status(500).json({
         success: false,
@@ -231,29 +227,32 @@ export const authController = {
     }
   },
 
-  // Obtener perfil de usuario actual
   getProfile: async (req, res) => {
     try {
       const user = await prisma.user.findUnique({
         where: { id: req.userId },
-        include: {
-          clinic: true,
-          vipSubscriptions: {
-            where: {
-              status: 'ACTIVE',
-              endDate: { gte: new Date() }
-            },
-            orderBy: { endDate: 'desc' },
-            take: 1
-          },
+        select: {
+          ...USER_BASE_SELECT,
+          clinic: USER_WITH_RELATIONS_INCLUDE.clinic,
+          vipSubscriptions: USER_WITH_RELATIONS_INCLUDE.vipSubscriptions,
           appointments: {
             where: {
               date: { gte: new Date() }
             },
             orderBy: { date: 'asc' },
             take: 5,
-            include: {
-              service: true
+            select: {
+              id: true,
+              date: true,
+              status: true,
+              service: {
+                select: {
+                  id: true,
+                  name: true,
+                  duration: true,
+                  price: true
+                }
+              }
             }
           }
         }
@@ -282,28 +281,32 @@ export const authController = {
     }
   },
 
-  // Actualizar perfil
   updateProfile: async (req, res) => {
     try {
       const { name, phone, bio, birthday, location } = req.body;
 
+      // Construir data object dinámicamente
+      const updateData = {};
+      if (name !== undefined) updateData.name = name;
+      if (phone !== undefined) updateData.phone = phone;
+      if (bio !== undefined) updateData.bio = bio;
+      if (birthday !== undefined) updateData.birthday = new Date(birthday);
+      if (location !== undefined) updateData.location = location;
+
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'No hay datos para actualizar'
+        });
+      }
+
       const updatedUser = await prisma.user.update({
         where: { id: req.userId },
-        data: {
-          ...(name && { name }),
-          ...(phone && { phone }),
-          ...(bio !== undefined && { bio }),
-          ...(birthday && { birthday: new Date(birthday) }),
-          ...(location && { location })
-        },
-        include: {
-          clinic: true,
-          vipSubscriptions: {
-            where: {
-              status: 'ACTIVE',
-              endDate: { gte: new Date() }
-            }
-          }
+        data: updateData,
+        select: {
+          ...USER_BASE_SELECT,
+          clinic: USER_WITH_RELATIONS_INCLUDE.clinic,
+          vipSubscriptions: USER_WITH_RELATIONS_INCLUDE.vipSubscriptions
         }
       });
 
@@ -324,7 +327,6 @@ export const authController = {
     }
   },
 
-  // Cambiar contraseña
   changePassword: async (req, res) => {
     try {
       const { currentPassword, newPassword } = req.body;
@@ -336,12 +338,18 @@ export const authController = {
         });
       }
 
-      // Obtener usuario actual
+      if (newPassword.length < 6) {
+        return res.status(400).json({
+          success: false,
+          error: 'La nueva contraseña debe tener al menos 6 caracteres'
+        });
+      }
+
       const user = await prisma.user.findUnique({
-        where: { id: req.userId }
+        where: { id: req.userId },
+        select: { id: true, email: true, password: true }
       });
 
-      // Verificar contraseña actual
       const isValidPassword = await bcrypt.compare(currentPassword, user.password);
       if (!isValidPassword) {
         return res.status(400).json({
@@ -350,18 +358,8 @@ export const authController = {
         });
       }
 
-      // Validar nueva contraseña
-      if (newPassword.length < 6) {
-        return res.status(400).json({
-          success: false,
-          error: 'La nueva contraseña debe tener al menos 6 caracteres'
-        });
-      }
+      const hashedNewPassword = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
 
-      // Hash nueva contraseña
-      const hashedNewPassword = await bcrypt.hash(newPassword, 12);
-
-      // Actualizar contraseña
       await prisma.user.update({
         where: { id: req.userId },
         data: { password: hashedNewPassword }
@@ -383,19 +381,14 @@ export const authController = {
     }
   },
 
-  // Verificar token
   verifyToken: async (req, res) => {
     try {
       const user = await prisma.user.findUnique({
         where: { id: req.userId },
-        include: {
-          clinic: true,
-          vipSubscriptions: {
-            where: {
-              status: 'ACTIVE',
-              endDate: { gte: new Date() }
-            }
-          }
+        select: {
+          ...USER_BASE_SELECT,
+          clinic: USER_WITH_RELATIONS_INCLUDE.clinic,
+          vipSubscriptions: USER_WITH_RELATIONS_INCLUDE.vipSubscriptions
         }
       });
 
@@ -422,15 +415,9 @@ export const authController = {
     }
   },
 
-  // Logout (invalidar token del lado del cliente)
   logout: async (req, res) => {
     try {
-      // En un sistema más avanzado, aquí podrías:
-      // - Agregar el token a una blacklist
-      // - Limpiar refresh tokens
-      // - Registrar el logout en logs
-
-      logger.info(`Usuario deslogueado: ${req.user.email}`);
+      logger.info(`Usuario deslogueado: ${req.user?.email || 'Unknown'}`);
 
       res.json({
         success: true,

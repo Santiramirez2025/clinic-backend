@@ -1,4 +1,4 @@
-// src/controllers/appointment.controller.js - CONTROLADOR COMPLETO PARA PRODUCCIÓN
+// src/controllers/appointment.controller.js - Controlador optimizado para producción
 import { PrismaClient } from '@prisma/client';
 import { logger } from '../utils/logger.js';
 import { appointmentSchema, updateAppointmentSchema } from '../validators/appointment.validators.js';
@@ -6,12 +6,132 @@ import { notificationService } from '../services/notificationService.js';
 
 const prisma = new PrismaClient();
 
-export const appointmentController = {
-  // ===============================
-  // MÉTODOS BÁSICOS
-  // ===============================
+// Selects optimizados para consultas frecuentes
+const APPOINTMENT_BASE_SELECT = {
+  id: true,
+  date: true,
+  time: true,
+  status: true,
+  notes: true,
+  originalPrice: true,
+  finalPrice: true,
+  vipDiscount: true,
+  createdAt: true,
+  updatedAt: true,
+  cancelledAt: true,
+  completedAt: true,
+  cancelReason: true
+};
 
-  // Crear nueva cita
+const SERVICE_SELECT = {
+  id: true,
+  name: true,
+  price: true,
+  duration: true,
+  vipDiscount: true,
+  isActive: true
+};
+
+const USER_SELECT = {
+  id: true,
+  name: true,
+  email: true,
+  phone: true
+};
+
+const CLINIC_SELECT = {
+  id: true,
+  name: true,
+  primaryColor: true,
+  address: true,
+  phone: true
+};
+
+const VIP_SUBSCRIPTION_WHERE = {
+  status: 'ACTIVE',
+  endDate: { gte: new Date() }
+};
+
+// Funciones de utilidad optimizadas
+const buildAppointmentWhere = (filters) => {
+  const where = {};
+  
+  if (filters.clinicId) where.clinicId = filters.clinicId;
+  if (filters.userId) where.userId = filters.userId;
+  if (filters.status) where.status = filters.status;
+  if (filters.serviceId) where.serviceId = filters.serviceId;
+  
+  if (filters.date) {
+    const startDate = new Date(filters.date);
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + 1);
+    where.date = { gte: startDate, lt: endDate };
+  }
+  
+  if (filters.dateFrom || filters.dateTo) {
+    where.date = {};
+    if (filters.dateFrom) where.date.gte = new Date(filters.dateFrom);
+    if (filters.dateTo) where.date.lte = new Date(filters.dateTo);
+  }
+  
+  if (filters.upcoming) {
+    where.date = { gte: new Date() };
+  }
+  
+  return where;
+};
+
+const calculateVIPPrice = (originalPrice, vipDiscount) => {
+  if (!vipDiscount || vipDiscount <= 0) return { finalPrice: originalPrice, vipDiscount: 0 };
+  return {
+    finalPrice: originalPrice * (1 - vipDiscount / 100),
+    vipDiscount
+  };
+};
+
+const checkUserVIPStatus = async (userId) => {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      vipSubscriptions: {
+        where: VIP_SUBSCRIPTION_WHERE,
+        select: { id: true },
+        take: 1
+      }
+    }
+  });
+  return user?.vipSubscriptions?.length > 0;
+};
+
+const validateServiceExists = async (serviceId, clinicId) => {
+  const service = await prisma.service.findFirst({
+    where: { id: serviceId, clinicId, isActive: true },
+    select: SERVICE_SELECT
+  });
+  return service;
+};
+
+const checkTimeAvailability = async (date, time, clinicId, excludeId = null) => {
+  const appointmentDateTime = new Date(`${date}T${time}:00`);
+  
+  const where = {
+    date: appointmentDateTime,
+    time,
+    clinicId,
+    status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
+  };
+  
+  if (excludeId) where.id = { not: excludeId };
+  
+  const existingAppointment = await prisma.appointment.findFirst({
+    where,
+    select: { id: true }
+  });
+  
+  return !existingAppointment;
+};
+
+export const appointmentController = {
   create: async (req, res) => {
     try {
       const validationResult = appointmentSchema.safeParse(req.body);
@@ -24,17 +144,14 @@ export const appointmentController = {
       }
 
       const { date, time, serviceId, notes } = validationResult.data;
-      const userId = req.userId;
-      const clinicId = req.clinicId;
+      const { userId, clinicId } = req;
 
-      // Verificar que el servicio existe y pertenece a la clínica
-      const service = await prisma.service.findFirst({
-        where: {
-          id: serviceId,
-          clinicId: clinicId,
-          isActive: true
-        }
-      });
+      // Validaciones paralelas
+      const [service, isAvailable, isVIP] = await Promise.all([
+        validateServiceExists(serviceId, clinicId),
+        checkTimeAvailability(date, time, clinicId),
+        checkUserVIPStatus(userId)
+      ]);
 
       if (!service) {
         return res.status(404).json({
@@ -43,27 +160,14 @@ export const appointmentController = {
         });
       }
 
-      // Verificar disponibilidad del horario
-      const appointmentDateTime = new Date(`${date}T${time}:00`);
-      const existingAppointment = await prisma.appointment.findFirst({
-        where: {
-          date: appointmentDateTime,
-          time: time,
-          clinicId: clinicId,
-          status: {
-            in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS']
-          }
-        }
-      });
-
-      if (existingAppointment) {
+      if (!isAvailable) {
         return res.status(409).json({
           success: false,
           error: 'Horario no disponible'
         });
       }
 
-      // Verificar que la fecha sea futura
+      const appointmentDateTime = new Date(`${date}T${time}:00`);
       if (appointmentDateTime <= new Date()) {
         return res.status(400).json({
           success: false,
@@ -71,30 +175,8 @@ export const appointmentController = {
         });
       }
 
-      // Calcular precios
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        include: {
-          vipSubscriptions: {
-            where: {
-              status: 'ACTIVE',
-              endDate: { gte: new Date() }
-            }
-          }
-        }
-      });
+      const pricing = calculateVIPPrice(service.price, isVIP ? service.vipDiscount : 0);
 
-      const isVIP = user.vipSubscriptions.length > 0;
-      const originalPrice = service.price;
-      let finalPrice = originalPrice;
-      let vipDiscount = 0;
-
-      if (isVIP && service.vipDiscount > 0) {
-        vipDiscount = service.vipDiscount;
-        finalPrice = originalPrice * (1 - vipDiscount / 100);
-      }
-
-      // Crear la cita
       const appointment = await prisma.appointment.create({
         data: {
           date: appointmentDateTime,
@@ -103,30 +185,21 @@ export const appointmentController = {
           userId,
           serviceId,
           clinicId,
-          originalPrice,
-          finalPrice,
-          vipDiscount
+          originalPrice: service.price,
+          finalPrice: pricing.finalPrice,
+          vipDiscount: pricing.vipDiscount
         },
-        include: {
-          service: true,
-          user: {
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              phone: true
-            }
-          },
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
-      // Enviar notificación de confirmación
-      try {
-        await notificationService.sendAppointmentConfirmation(appointment);
-      } catch (notificationError) {
-        logger.warn('Error enviando notificación:', notificationError);
-      }
+      // Notificación asíncrona no bloqueante
+      notificationService.sendAppointmentConfirmation(appointment)
+        .catch(err => logger.warn('Error enviando notificación:', err));
 
       logger.info(`Cita creada: ${appointment.id} para usuario ${userId}`);
 
@@ -145,44 +218,32 @@ export const appointmentController = {
     }
   },
 
-  // Obtener citas del usuario
   getUserAppointments: async (req, res) => {
     try {
       const { status, upcoming, page = 1, limit = 10 } = req.query;
-      const userId = req.userId;
+      const { userId, clinicId } = req;
 
-      const where = {
-        userId,
-        ...(req.clinicId && { clinicId: req.clinicId })
-      };
-
-      // Filtros
-      if (status) {
-        where.status = status;
-      }
-
-      if (upcoming === 'true') {
-        where.date = { gte: new Date() };
-      }
+      const where = buildAppointmentWhere({ 
+        userId, 
+        clinicId: clinicId || undefined, 
+        status, 
+        upcoming 
+      });
 
       const skip = (parseInt(page) - 1) * parseInt(limit);
+      const take = parseInt(limit);
 
       const [appointments, total] = await Promise.all([
         prisma.appointment.findMany({
           where,
-          include: {
-            service: true,
-            clinic: {
-              select: {
-                id: true,
-                name: true,
-                primaryColor: true
-              }
-            }
+          select: {
+            ...APPOINTMENT_BASE_SELECT,
+            service: { select: SERVICE_SELECT },
+            clinic: { select: CLINIC_SELECT }
           },
           orderBy: { date: 'desc' },
           skip,
-          take: parseInt(limit)
+          take
         }),
         prisma.appointment.count({ where })
       ]);
@@ -193,9 +254,9 @@ export const appointmentController = {
           appointments,
           pagination: {
             page: parseInt(page),
-            limit: parseInt(limit),
+            limit: take,
             total,
-            pages: Math.ceil(total / parseInt(limit))
+            pages: Math.ceil(total / take)
           }
         }
       });
@@ -209,72 +270,64 @@ export const appointmentController = {
     }
   },
 
-  // Obtener todas las citas (para staff/admin)
   getAll: async (req, res) => {
     try {
-      const { date, status, userId, page = 1, limit = 20 } = req.query;
-      const clinicId = req.clinicId;
+      const { date, status, userId: searchUserId, page = 1, limit = 20 } = req.query;
+      const { clinicId } = req;
 
-      const where = {
-        clinicId
-      };
-
-      // Filtros
-      if (date) {
-        const startDate = new Date(date);
-        const endDate = new Date(startDate);
-        endDate.setDate(endDate.getDate() + 1);
-        
-        where.date = {
-          gte: startDate,
-          lt: endDate
-        };
-      }
-
-      if (status) {
-        where.status = status;
-      }
-
-      if (userId) {
-        where.userId = userId;
-      }
+      const where = buildAppointmentWhere({ 
+        clinicId, 
+        date, 
+        status, 
+        userId: searchUserId 
+      });
 
       const skip = (parseInt(page) - 1) * parseInt(limit);
+      const take = parseInt(limit);
 
       const [appointments, total] = await Promise.all([
         prisma.appointment.findMany({
           where,
-          include: {
-            service: true,
-            user: {
+          select: {
+            ...APPOINTMENT_BASE_SELECT,
+            service: { select: SERVICE_SELECT },
+            user: { 
               select: {
-                id: true,
-                name: true,
-                email: true,
-                phone: true,
-                isVIP: true
+                ...USER_SELECT,
+                vipSubscriptions: {
+                  where: VIP_SUBSCRIPTION_WHERE,
+                  select: { id: true },
+                  take: 1
+                }
               }
             }
           },
-          orderBy: [
-            { date: 'asc' },
-            { time: 'asc' }
-          ],
+          orderBy: [{ date: 'asc' }, { time: 'asc' }],
           skip,
-          take: parseInt(limit)
+          take
         }),
         prisma.appointment.count({ where })
       ]);
 
+      // Añadir isVIP calculado
+      const appointmentsWithVIP = appointments.map(apt => ({
+        ...apt,
+        user: {
+          ...apt.user,
+          isVIP: apt.user.vipSubscriptions?.length > 0,
+          vipSubscriptions: undefined
+        }
+      }));
+
       res.json({
         success: true,
         data: {
-          appointments,
+          appointments: appointmentsWithVIP,
           pagination: {
             page: parseInt(page),
-            limit: parseInt(limit),
+            limit: take,
             total,
-            pages: Math.ceil(total / parseInt(limit))
+            pages: Math.ceil(total / take)
           }
         }
       });
@@ -288,36 +341,34 @@ export const appointmentController = {
     }
   },
 
-  // Obtener cita por ID
   getById: async (req, res) => {
     try {
       const { id } = req.params;
-      const userId = req.userId;
-      const userRole = req.userRole;
+      const { userId, userRole, clinicId } = req;
 
       const where = { id };
-
-      // Si es cliente, solo puede ver sus propias citas
       if (userRole === 'CLIENTE') {
         where.userId = userId;
-      } else if (req.clinicId) {
-        where.clinicId = req.clinicId;
+      } else if (clinicId) {
+        where.clinicId = clinicId;
       }
 
       const appointment = await prisma.appointment.findFirst({
         where,
-        include: {
-          service: true,
-          user: {
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { 
             select: {
-              id: true,
-              name: true,
-              email: true,
-              phone: true,
-              isVIP: true
+              ...USER_SELECT,
+              vipSubscriptions: {
+                where: VIP_SUBSCRIPTION_WHERE,
+                select: { id: true },
+                take: 1
+              }
             }
           },
-          clinic: true
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
@@ -328,9 +379,19 @@ export const appointmentController = {
         });
       }
 
+      // Formatear respuesta
+      const formattedAppointment = {
+        ...appointment,
+        user: {
+          ...appointment.user,
+          isVIP: appointment.user.vipSubscriptions?.length > 0,
+          vipSubscriptions: undefined
+        }
+      };
+
       res.json({
         success: true,
-        data: { appointment }
+        data: { appointment: formattedAppointment }
       });
 
     } catch (error) {
@@ -342,12 +403,10 @@ export const appointmentController = {
     }
   },
 
-  // Actualizar cita
   update: async (req, res) => {
     try {
       const { id } = req.params;
-      const userId = req.userId;
-      const userRole = req.userRole;
+      const { userId, userRole } = req;
 
       const validationResult = updateAppointmentSchema.safeParse(req.body);
       if (!validationResult.success) {
@@ -358,9 +417,16 @@ export const appointmentController = {
         });
       }
 
-      // Verificar que la cita existe
       const existingAppointment = await prisma.appointment.findUnique({
-        where: { id }
+        where: { id },
+        select: { 
+          id: true, 
+          userId: true, 
+          clinicId: true, 
+          date: true, 
+          time: true,
+          serviceId: true
+        }
       });
 
       if (!existingAppointment) {
@@ -370,7 +436,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar permisos
       if (userRole === 'CLIENTE' && existingAppointment.userId !== userId) {
         return res.status(403).json({
           success: false,
@@ -381,31 +446,26 @@ export const appointmentController = {
       const { date, time, serviceId, notes, status } = validationResult.data;
       const updateData = {};
 
-      // Solo staff/admin pueden cambiar el estado
       if (status && ['ADMIN', 'STAFF'].includes(userRole)) {
         updateData.status = status;
       }
 
-      // Validaciones para cambios de fecha/hora
+      // Validaciones de fecha/hora si hay cambios
       if (date || time) {
-        const newDate = date ? new Date(`${date}T${time || existingAppointment.time}:00`) : 
-                              new Date(`${existingAppointment.date.toISOString().split('T')[0]}T${time}:00`);
-
-        // Verificar disponibilidad si hay cambio de fecha/hora
-        if (date !== existingAppointment.date.toISOString().split('T')[0] || 
-            time !== existingAppointment.time) {
+        const newDate = date || existingAppointment.date.toISOString().split('T')[0];
+        const newTime = time || existingAppointment.time;
+        
+        if (newDate !== existingAppointment.date.toISOString().split('T')[0] || 
+            newTime !== existingAppointment.time) {
           
-          const conflictingAppointment = await prisma.appointment.findFirst({
-            where: {
-              id: { not: id },
-              date: newDate,
-              time: time || existingAppointment.time,
-              clinicId: existingAppointment.clinicId,
-              status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
-            }
-          });
-
-          if (conflictingAppointment) {
+          const isAvailable = await checkTimeAvailability(
+            newDate, 
+            newTime, 
+            existingAppointment.clinicId, 
+            id
+          );
+          
+          if (!isAvailable) {
             return res.status(409).json({
               success: false,
               error: 'Horario no disponible'
@@ -413,19 +473,16 @@ export const appointmentController = {
           }
         }
 
-        if (date) updateData.date = newDate;
+        if (date) updateData.date = new Date(`${date}T${newTime}:00`);
         if (time) updateData.time = time;
       }
 
-      if (serviceId) {
-        // Verificar que el servicio existe
-        const service = await prisma.service.findFirst({
-          where: {
-            id: serviceId,
-            clinicId: existingAppointment.clinicId,
-            isActive: true
-          }
-        });
+      // Actualizar servicio y recalcular precios
+      if (serviceId && serviceId !== existingAppointment.serviceId) {
+        const [service, isVIP] = await Promise.all([
+          validateServiceExists(serviceId, existingAppointment.clinicId),
+          checkUserVIPStatus(existingAppointment.userId)
+        ]);
 
         if (!service) {
           return res.status(404).json({
@@ -435,50 +492,32 @@ export const appointmentController = {
         }
 
         updateData.serviceId = serviceId;
-        
-        // Recalcular precios si cambia el servicio
-        const user = await prisma.user.findUnique({
-          where: { id: existingAppointment.userId },
-          include: {
-            vipSubscriptions: {
-              where: {
-                status: 'ACTIVE',
-                endDate: { gte: new Date() }
-              }
-            }
-          }
-        });
-
-        const isVIP = user.vipSubscriptions.length > 0;
         updateData.originalPrice = service.price;
-        updateData.finalPrice = service.price;
-        updateData.vipDiscount = 0;
-
-        if (isVIP && service.vipDiscount > 0) {
-          updateData.vipDiscount = service.vipDiscount;
-          updateData.finalPrice = service.price * (1 - service.vipDiscount / 100);
-        }
+        
+        const pricing = calculateVIPPrice(service.price, isVIP ? service.vipDiscount : 0);
+        updateData.finalPrice = pricing.finalPrice;
+        updateData.vipDiscount = pricing.vipDiscount;
       }
 
       if (notes !== undefined) {
         updateData.notes = notes;
       }
 
-      // Actualizar cita
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'No hay datos para actualizar'
+        });
+      }
+
       const updatedAppointment = await prisma.appointment.update({
         where: { id },
         data: updateData,
-        include: {
-          service: true,
-          user: {
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              phone: true
-            }
-          },
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
@@ -499,20 +538,21 @@ export const appointmentController = {
     }
   },
 
-  // Cancelar cita
   cancel: async (req, res) => {
     try {
       const { id } = req.params;
       const { reason } = req.body;
-      const userId = req.userId;
-      const userRole = req.userRole;
+      const { userId, userRole } = req;
 
       const appointment = await prisma.appointment.findUnique({
         where: { id },
-        include: {
-          user: true,
-          service: true,
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          userId: true,
+          status: true,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
@@ -523,7 +563,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar permisos
       if (userRole === 'CLIENTE' && appointment.userId !== userId) {
         return res.status(403).json({
           success: false,
@@ -531,7 +570,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar que la cita se puede cancelar
       if (appointment.status === 'CANCELLED') {
         return res.status(400).json({
           success: false,
@@ -546,7 +584,6 @@ export const appointmentController = {
         });
       }
 
-      // Cancelar cita
       const cancelledAppointment = await prisma.appointment.update({
         where: { id },
         data: {
@@ -554,19 +591,17 @@ export const appointmentController = {
           cancelledAt: new Date(),
           cancelReason: reason || 'No especificado'
         },
-        include: {
-          service: true,
-          user: true,
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
-      // Enviar notificación de cancelación
-      try {
-        await notificationService.sendAppointmentCancellation(cancelledAppointment);
-      } catch (notificationError) {
-        logger.warn('Error enviando notificación de cancelación:', notificationError);
-      }
+      // Notificación asíncrona
+      notificationService.sendAppointmentCancellation(cancelledAppointment)
+        .catch(err => logger.warn('Error enviando notificación de cancelación:', err));
 
       logger.info(`Cita cancelada: ${id} por usuario ${userId}`);
 
@@ -585,23 +620,22 @@ export const appointmentController = {
     }
   },
 
-  // ===============================
-  // MÉTODOS AVANZADOS
-  // ===============================
-
-  // 🔔 Enviar recordatorio de cita
   sendReminder: async (req, res) => {
     try {
       const { id } = req.params;
-      const userId = req.userId;
-      const userRole = req.userRole;
+      const { userId, userRole } = req;
 
       const appointment = await prisma.appointment.findUnique({
         where: { id },
-        include: {
-          user: true,
-          service: true,
-          clinic: true
+        select: {
+          id: true,
+          userId: true,
+          status: true,
+          user: { select: USER_SELECT },
+          service: { select: SERVICE_SELECT },
+          clinic: { select: CLINIC_SELECT },
+          date: true,
+          time: true
         }
       });
 
@@ -612,7 +646,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar permisos
       if (userRole === 'CLIENTE' && appointment.userId !== userId) {
         return res.status(403).json({
           success: false,
@@ -620,7 +653,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar que la cita esté programada o confirmada
       if (!['SCHEDULED', 'CONFIRMED'].includes(appointment.status)) {
         return res.status(400).json({
           success: false,
@@ -628,23 +660,21 @@ export const appointmentController = {
         });
       }
 
-      // Enviar notificación
       try {
         await notificationService.sendAppointmentReminder(appointment);
+        logger.info(`Recordatorio enviado para cita: ${id}`);
+        
+        res.json({
+          success: true,
+          message: 'Recordatorio enviado exitosamente'
+        });
       } catch (notificationError) {
         logger.error('Error enviando recordatorio:', notificationError);
-        return res.status(500).json({
+        res.status(500).json({
           success: false,
           error: 'Error enviando recordatorio'
         });
       }
-
-      logger.info(`Recordatorio enviado para cita: ${id}`);
-
-      res.json({
-        success: true,
-        message: 'Recordatorio enviado exitosamente'
-      });
 
     } catch (error) {
       logger.error('Error enviando recordatorio:', error);
@@ -655,7 +685,6 @@ export const appointmentController = {
     }
   },
 
-  // 🔍 Buscar citas con filtros avanzados
   search: async (req, res) => {
     try {
       const {
@@ -669,119 +698,73 @@ export const appointmentController = {
         limit = 20
       } = req.query;
       
-      const userId = req.userId;
-      const userRole = req.userRole;
-      const clinicId = req.clinicId;
+      const { userId, userRole, clinicId } = req;
 
-      const where = {};
+      const where = buildAppointmentWhere({
+        clinicId,
+        userId: userRole === 'CLIENTE' ? userId : searchUserId,
+        status,
+        serviceId,
+        dateFrom,
+        dateTo
+      });
 
-      // Filtrar por clínica si no es super admin
-      if (clinicId) {
-        where.clinicId = clinicId;
-      }
-
-      // Si es cliente, solo puede ver sus citas
-      if (userRole === 'CLIENTE') {
-        where.userId = userId;
-      } else if (searchUserId) {
-        where.userId = searchUserId;
-      }
-
-      // Filtros adicionales
-      if (status) {
-        where.status = status;
-      }
-
-      if (serviceId) {
-        where.serviceId = serviceId;
-      }
-
-      if (dateFrom || dateTo) {
-        where.date = {};
-        if (dateFrom) where.date.gte = new Date(dateFrom);
-        if (dateTo) where.date.lte = new Date(dateTo);
-      }
-
-      // Búsqueda por texto
       if (query) {
         where.OR = [
-          {
-            service: {
-              name: {
-                contains: query,
-                mode: 'insensitive'
-              }
-            }
-          },
-          {
-            user: {
-              name: {
-                contains: query,
-                mode: 'insensitive'
-              }
-            }
-          },
-          {
-            notes: {
-              contains: query,
-              mode: 'insensitive'
-            }
-          }
+          { service: { name: { contains: query, mode: 'insensitive' } } },
+          { user: { name: { contains: query, mode: 'insensitive' } } },
+          { notes: { contains: query, mode: 'insensitive' } }
         ];
       }
 
       const skip = (parseInt(page) - 1) * parseInt(limit);
+      const take = parseInt(limit);
 
       const [appointments, total] = await Promise.all([
         prisma.appointment.findMany({
           where,
-          include: {
-            service: true,
-            user: {
+          select: {
+            ...APPOINTMENT_BASE_SELECT,
+            service: { select: SERVICE_SELECT },
+            user: { 
               select: {
-                id: true,
-                name: true,
-                email: true,
-                phone: true,
-                isVIP: true
+                ...USER_SELECT,
+                vipSubscriptions: {
+                  where: VIP_SUBSCRIPTION_WHERE,
+                  select: { id: true },
+                  take: 1
+                }
               }
             },
-            clinic: {
-              select: {
-                id: true,
-                name: true,
-                primaryColor: true
-              }
-            }
+            clinic: { select: CLINIC_SELECT }
           },
-          orderBy: [
-            { date: 'desc' },
-            { time: 'desc' }
-          ],
+          orderBy: [{ date: 'desc' }, { time: 'desc' }],
           skip,
-          take: parseInt(limit)
+          take
         }),
         prisma.appointment.count({ where })
       ]);
 
+      const appointmentsWithVIP = appointments.map(apt => ({
+        ...apt,
+        user: {
+          ...apt.user,
+          isVIP: apt.user.vipSubscriptions?.length > 0,
+          vipSubscriptions: undefined
+        }
+      }));
+
       res.json({
         success: true,
         data: {
-          appointments,
+          appointments: appointmentsWithVIP,
           pagination: {
             page: parseInt(page),
-            limit: parseInt(limit),
+            limit: take,
             total,
-            pages: Math.ceil(total / parseInt(limit))
+            pages: Math.ceil(total / take)
           },
-          filters: {
-            query,
-            status,
-            dateFrom,
-            dateTo,
-            serviceId,
-            userId: searchUserId
-          }
+          filters: { query, status, dateFrom, dateTo, serviceId, userId: searchUserId }
         }
       });
 
@@ -794,13 +777,11 @@ export const appointmentController = {
     }
   },
 
-  // 🔄 Reprogramar cita
   reschedule: async (req, res) => {
     try {
       const { id } = req.params;
       const { newDate, newTime, reason } = req.body;
-      const userId = req.userId;
-      const userRole = req.userRole;
+      const { userId, userRole } = req;
 
       if (!newDate || !newTime) {
         return res.status(400).json({
@@ -811,10 +792,15 @@ export const appointmentController = {
 
       const appointment = await prisma.appointment.findUnique({
         where: { id },
-        include: {
-          user: true,
-          service: true,
-          clinic: true
+        select: {
+          id: true,
+          userId: true,
+          clinicId: true,
+          date: true,
+          time: true,
+          user: { select: USER_SELECT },
+          service: { select: SERVICE_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
@@ -825,7 +811,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar permisos
       if (userRole === 'CLIENTE' && appointment.userId !== userId) {
         return res.status(403).json({
           success: false,
@@ -833,7 +818,6 @@ export const appointmentController = {
         });
       }
 
-      // Verificar que la nueva fecha sea futura
       const newAppointmentDateTime = new Date(`${newDate}T${newTime}:00`);
       if (newAppointmentDateTime <= new Date()) {
         return res.status(400).json({
@@ -842,48 +826,34 @@ export const appointmentController = {
         });
       }
 
-      // Verificar disponibilidad del nuevo horario
-      const conflictingAppointment = await prisma.appointment.findFirst({
-        where: {
-          id: { not: id },
-          date: newAppointmentDateTime,
-          time: newTime,
-          clinicId: appointment.clinicId,
-          status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
-        }
-      });
-
-      if (conflictingAppointment) {
+      const isAvailable = await checkTimeAvailability(newDate, newTime, appointment.clinicId, id);
+      if (!isAvailable) {
         return res.status(409).json({
           success: false,
           error: 'El nuevo horario no está disponible'
         });
       }
 
-      // Actualizar cita
       const rescheduledAppointment = await prisma.appointment.update({
         where: { id },
         data: {
           date: newAppointmentDateTime,
           time: newTime,
-          status: 'SCHEDULED' // Reset to scheduled
+          status: 'SCHEDULED'
         },
-        include: {
-          service: true,
-          user: true,
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
-      // Enviar notificación de reprogramación
-      try {
-        await notificationService.sendAppointmentReschedule(rescheduledAppointment, {
-          oldDate: appointment.date,
-          oldTime: appointment.time
-        });
-      } catch (notificationError) {
-        logger.warn('Error enviando notificación de reprogramación:', notificationError);
-      }
+      // Notificación asíncrona
+      notificationService.sendAppointmentReschedule(rescheduledAppointment, {
+        oldDate: appointment.date,
+        oldTime: appointment.time
+      }).catch(err => logger.warn('Error enviando notificación de reprogramación:', err));
 
       logger.info(`Cita reprogramada: ${id} por usuario ${userId}`);
 
@@ -902,11 +872,10 @@ export const appointmentController = {
     }
   },
 
-  // 📊 Verificar disponibilidad en tiempo real
   checkAvailability: async (req, res) => {
     try {
       const { date, time, serviceId } = req.body;
-      const clinicId = req.clinicId;
+      const { clinicId } = req;
 
       if (!date || !time || !serviceId) {
         return res.status(400).json({
@@ -915,14 +884,10 @@ export const appointmentController = {
         });
       }
 
-      // Verificar que el servicio existe
-      const service = await prisma.service.findFirst({
-        where: {
-          id: serviceId,
-          clinicId,
-          isActive: true
-        }
-      });
+      const [service, isAvailable] = await Promise.all([
+        validateServiceExists(serviceId, clinicId),
+        checkTimeAvailability(date, time, clinicId)
+      ]);
 
       if (!service) {
         return res.status(404).json({
@@ -931,57 +896,38 @@ export const appointmentController = {
         });
       }
 
-      // Verificar disponibilidad
-      const appointmentDateTime = new Date(`${date}T${time}:00`);
-      const existingAppointment = await prisma.appointment.findFirst({
-        where: {
-          date: appointmentDateTime,
-          time,
-          clinicId,
-          status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
-        }
-      });
-
-      const isAvailable = !existingAppointment;
-      
-      // Obtener horarios alternativos si no está disponible
       let alternativeSlots = [];
       if (!isAvailable) {
-        const startOfDay = new Date(date);
-        const endOfDay = new Date(startOfDay);
-        endOfDay.setDate(endOfDay.getDate() + 1);
-
-        const dayAppointments = await prisma.appointment.findMany({
-          where: {
-            clinicId,
-            date: {
-              gte: startOfDay,
-              lt: endOfDay
+        // Obtener alternativas optimizadas
+        const [clinic, dayAppointments] = await Promise.all([
+          prisma.clinic.findUnique({
+            where: { id: clinicId },
+            select: { openTime: true, closeTime: true }
+          }),
+          prisma.appointment.findMany({
+            where: {
+              clinicId,
+              date: {
+                gte: new Date(date),
+                lt: new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000)
+              },
+              status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
             },
-            status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
-          },
-          select: { time: true }
-        });
+            select: { time: true }
+          })
+        ]);
 
-        const bookedTimes = dayAppointments.map(apt => apt.time);
-        
-        // Generar horarios alternativos (simplificado)
-        const clinic = await prisma.clinic.findUnique({
-          where: { id: clinicId }
-        });
-        
+        const bookedTimes = new Set(dayAppointments.map(apt => apt.time));
         const [openHour] = clinic.openTime.split(':').map(Number);
         const [closeHour] = clinic.closeTime.split(':').map(Number);
-        
-        for (let hour = openHour; hour < closeHour; hour++) {
-          for (let minute = 0; minute < 60; minute += 30) {
+
+        for (let hour = openHour; hour < closeHour && alternativeSlots.length < 6; hour++) {
+          for (let minute = 0; minute < 60 && alternativeSlots.length < 6; minute += 30) {
             const timeSlot = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-            if (!bookedTimes.includes(timeSlot) && timeSlot !== time) {
+            if (!bookedTimes.has(timeSlot) && timeSlot !== time) {
               alternativeSlots.push(timeSlot);
-              if (alternativeSlots.length >= 6) break;
             }
           }
-          if (alternativeSlots.length >= 6) break;
         }
       }
 
@@ -990,13 +936,8 @@ export const appointmentController = {
         data: {
           isAvailable,
           requestedSlot: { date, time },
-          service: {
-            name: service.name,
-            duration: service.duration
-          },
-          ...(alternativeSlots.length > 0 && {
-            alternativeSlots: alternativeSlots.slice(0, 6)
-          })
+          service: { name: service.name, duration: service.duration },
+          ...(alternativeSlots.length > 0 && { alternativeSlots })
         }
       });
 
@@ -1009,11 +950,10 @@ export const appointmentController = {
     }
   },
 
-  // Obtener horarios disponibles (MEJORADO)
   getAvailableSlots: async (req, res) => {
     try {
       const { date, serviceId } = req.query;
-      const clinicId = req.clinicId;
+      const { clinicId } = req;
 
       if (!date || !serviceId) {
         return res.status(400).json({
@@ -1022,14 +962,28 @@ export const appointmentController = {
         });
       }
 
-      // Verificar que el servicio existe
-      const service = await prisma.service.findFirst({
-        where: {
-          id: serviceId,
-          clinicId,
-          isActive: true
-        }
-      });
+      const [service, clinic, dayAppointments] = await Promise.all([
+        validateServiceExists(serviceId, clinicId),
+        prisma.clinic.findUnique({
+          where: { id: clinicId },
+          select: { 
+            openTime: true, 
+            closeTime: true, 
+            workingDays: true 
+          }
+        }),
+        prisma.appointment.findMany({
+          where: {
+            clinicId,
+            date: {
+              gte: new Date(date),
+              lt: new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000)
+            },
+            status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
+          },
+          select: { time: true }
+        })
+      ]);
 
       if (!service) {
         return res.status(404).json({
@@ -1038,21 +992,12 @@ export const appointmentController = {
         });
       }
 
-      // Obtener configuración de la clínica
-      const clinic = await prisma.clinic.findUnique({
-        where: { id: clinicId }
-      });
-
-      // Generar horarios disponibles
       const requestedDate = new Date(date);
-      const dayOfWeek = requestedDate.getDay(); // 0 = Sunday, 1 = Monday, etc.
-      
-      // Verificar si workingDays existe, si no, usar días de lunes a viernes por defecto
+      const dayOfWeek = requestedDate.getDay();
       const workingDays = clinic.workingDays ? 
         clinic.workingDays.split(',').map(d => parseInt(d)) : 
-        [1, 2, 3, 4, 5]; // Lunes a Viernes por defecto
-      
-      // Verificar si el día es laborable
+        [1, 2, 3, 4, 5];
+
       if (!workingDays.includes(dayOfWeek === 0 ? 7 : dayOfWeek)) {
         return res.json({
           success: true,
@@ -1060,45 +1005,23 @@ export const appointmentController = {
         });
       }
 
-      // Obtener citas existentes para esa fecha
-      const startOfDay = new Date(date);
-      const endOfDay = new Date(startOfDay);
-      endOfDay.setDate(endOfDay.getDate() + 1);
-
-      const existingAppointments = await prisma.appointment.findMany({
-        where: {
-          clinicId,
-          date: {
-            gte: startOfDay,
-            lt: endOfDay
-          },
-          status: { in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS'] }
-        },
-        select: { time: true }
-      });
-
-      const bookedTimes = existingAppointments.map(apt => apt.time);
-
-      // Generar horarios disponibles
+      const bookedTimes = new Set(dayAppointments.map(apt => apt.time));
       const availableSlots = [];
-      const openTime = clinic.openTime || "09:00"; // Default si no está definido
-      const closeTime = clinic.closeTime || "18:00"; // Default si no está definido
       
+      const openTime = clinic.openTime || "09:00";
+      const closeTime = clinic.closeTime || "18:00";
       const [openHour, openMinute] = openTime.split(':').map(Number);
       const [closeHour, closeMinute] = closeTime.split(':').map(Number);
-      
-      const serviceDuration = service.duration || 60; // minutos
-      const slotInterval = 30; // intervalos de 30 minutos
-      
+      const serviceDuration = service.duration || 60;
+      const slotInterval = 30;
+
       let currentHour = openHour;
       let currentMinute = openMinute;
-      
+
       while (currentHour < closeHour || (currentHour === closeHour && currentMinute < closeMinute)) {
         const timeSlot = `${currentHour.toString().padStart(2, '0')}:${currentMinute.toString().padStart(2, '0')}`;
         
-        // Verificar si el horario no está ocupado
-        if (!bookedTimes.includes(timeSlot)) {
-          // Verificar que hay tiempo suficiente para el servicio antes del cierre
+        if (!bookedTimes.has(timeSlot)) {
           const slotEndMinutes = currentHour * 60 + currentMinute + serviceDuration;
           const closeMinutes = closeHour * 60 + closeMinute;
           
@@ -1107,7 +1030,6 @@ export const appointmentController = {
           }
         }
         
-        // Avanzar al siguiente slot
         currentMinute += slotInterval;
         if (currentMinute >= 60) {
           currentHour++;
@@ -1129,17 +1051,12 @@ export const appointmentController = {
     }
   },
 
-  // Obtener estadísticas de citas (MEJORADO)
   getStats: async (req, res) => {
     try {
       const { period = 'month' } = req.query;
-      const userId = req.userId;
-      const userRole = req.userRole;
-      const clinicId = req.clinicId;
+      const { userId, userRole, clinicId } = req;
 
       let startDate = new Date();
-      
-      // Configurar período
       switch (period) {
         case 'week':
           startDate.setDate(startDate.getDate() - 7);
@@ -1158,67 +1075,50 @@ export const appointmentController = {
       }
 
       const where = {
-        createdAt: { gte: startDate }
+        createdAt: { gte: startDate },
+        ...(userRole === 'CLIENTE' ? { userId } : { clinicId })
       };
 
-      // Filtrar por usuario si es cliente
-      if (userRole === 'CLIENTE') {
-        where.userId = userId;
-      } else if (clinicId) {
-        where.clinicId = clinicId;
-      }
-
-      const [
-        totalAppointments,
-        completedAppointments,
-        cancelledAppointments,
-        scheduledAppointments,
-        totalRevenue
-      ] = await Promise.all([
-        prisma.appointment.count({ where }),
-        prisma.appointment.count({ 
-          where: { ...where, status: 'COMPLETED' } 
-        }),
-        prisma.appointment.count({ 
-          where: { ...where, status: 'CANCELLED' } 
-        }),
-        prisma.appointment.count({ 
-          where: { ...where, status: { in: ['SCHEDULED', 'CONFIRMED'] } } 
-        }),
-        prisma.appointment.aggregate({
-          where: { ...where, status: 'COMPLETED' },
-          _sum: { finalPrice: true }
+      const [stats, nextAppointment] = await Promise.all([
+        Promise.all([
+          prisma.appointment.count({ where }),
+          prisma.appointment.count({ where: { ...where, status: 'COMPLETED' } }),
+          prisma.appointment.count({ where: { ...where, status: 'CANCELLED' } }),
+          prisma.appointment.count({ where: { ...where, status: { in: ['SCHEDULED', 'CONFIRMED'] } } }),
+          prisma.appointment.aggregate({
+            where: { ...where, status: 'COMPLETED' },
+            _sum: { finalPrice: true }
+          })
+        ]),
+        prisma.appointment.findFirst({
+          where: {
+            ...(userRole === 'CLIENTE' ? { userId } : { clinicId }),
+            date: { gte: new Date() },
+            status: { in: ['SCHEDULED', 'CONFIRMED'] }
+          },
+          select: {
+            ...APPOINTMENT_BASE_SELECT,
+            service: { select: SERVICE_SELECT },
+            ...(userRole !== 'CLIENTE' && {
+              user: { select: { name: true, phone: true } }
+            })
+          },
+          orderBy: { date: 'asc' }
         })
       ]);
 
-      // Obtener próxima cita
-      const nextAppointment = await prisma.appointment.findFirst({
-        where: {
-          ...(userRole === 'CLIENTE' ? { userId } : { clinicId }),
-          date: { gte: new Date() },
-          status: { in: ['SCHEDULED', 'CONFIRMED'] }
-        },
-        include: {
-          service: true,
-          ...(userRole !== 'CLIENTE' && {
-            user: {
-              select: { name: true, phone: true }
-            }
-          })
-        },
-        orderBy: { date: 'asc' }
-      });
+      const [total, completed, cancelled, scheduled, revenue] = stats;
 
       res.json({
         success: true,
         data: {
           stats: {
-            total: totalAppointments,
-            completed: completedAppointments,
-            cancelled: cancelledAppointments,
-            scheduled: scheduledAppointments,
-            revenue: totalRevenue._sum.finalPrice || 0,
-            completionRate: totalAppointments > 0 ? (completedAppointments / totalAppointments * 100).toFixed(1) : 0
+            total,
+            completed,
+            cancelled,
+            scheduled,
+            revenue: revenue._sum.finalPrice || 0,
+            completionRate: total > 0 ? (completed / total * 100).toFixed(1) : 0
           },
           nextAppointment,
           period
@@ -1234,18 +1134,14 @@ export const appointmentController = {
     }
   },
 
-  // 📊 Estadísticas detalladas
   getDetailedStats: async (req, res) => {
     try {
       const { period = 'month', compareWith } = req.query;
-      const userId = req.userId;
-      const userRole = req.userRole;
-      const clinicId = req.clinicId;
+      const { userId, userRole, clinicId } = req;
 
       let startDate = new Date();
-      let endDate = new Date();
-      
-      // Configurar período actual
+      const endDate = new Date();
+
       switch (period) {
         case 'week':
           startDate.setDate(startDate.getDate() - 7);
@@ -1264,82 +1160,57 @@ export const appointmentController = {
       }
 
       const where = {
-        date: { gte: startDate, lte: endDate }
+        date: { gte: startDate, lte: endDate },
+        ...(userRole === 'CLIENTE' ? { userId } : { clinicId })
       };
 
-      // Filtrar por usuario si es cliente
-      if (userRole === 'CLIENTE') {
-        where.userId = userId;
-      } else if (clinicId) {
-        where.clinicId = clinicId;
-      }
-
-      // Obtener estadísticas principales
-      const [
-        totalAppointments,
-        appointmentsByStatus,
-        appointmentsByService,
-        cancelationRate
-      ] = await Promise.all([
-        // Total de citas
+      const [totalAppointments, appointmentsByStatus, completedAppointments] = await Promise.all([
         prisma.appointment.count({ where }),
-        
-        // Citas por estado
         prisma.appointment.groupBy({
           by: ['status'],
           where,
           _count: { status: true }
         }),
-        
-        // Citas por servicio con ingresos
         prisma.appointment.findMany({
           where: { ...where, status: 'COMPLETED' },
-          include: {
-            service: {
-              select: { name: true, price: true }
-            }
+          select: {
+            finalPrice: true,
+            service: { select: { name: true, price: true } }
           }
-        }).then(appointments => {
-          const serviceStats = {};
-          appointments.forEach(apt => {
-            const serviceName = apt.service.name;
-            if (!serviceStats[serviceName]) {
-              serviceStats[serviceName] = {
-                count: 0,
-                revenue: 0,
-                name: serviceName
-              };
-            }
-            serviceStats[serviceName].count++;
-            serviceStats[serviceName].revenue += apt.finalPrice || 0;
-          });
-          return Object.values(serviceStats).sort((a, b) => b.count - a.count);
-        }),
-        
-        // Tasa de cancelación
-        prisma.appointment.count({
-          where: { ...where, status: 'CANCELLED' }
-        }).then(cancelled => 
-          totalAppointments > 0 ? (cancelled / totalAppointments * 100).toFixed(1) : 0
-        )
+        })
       ]);
 
-      // Estadísticas de comparación si se solicita
+      const serviceStats = {};
+      completedAppointments.forEach(apt => {
+        const serviceName = apt.service.name;
+        if (!serviceStats[serviceName]) {
+          serviceStats[serviceName] = { count: 0, revenue: 0, name: serviceName };
+        }
+        serviceStats[serviceName].count++;
+        serviceStats[serviceName].revenue += apt.finalPrice || 0;
+      });
+
+      const topServices = Object.values(serviceStats)
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 5);
+
+      const cancelledCount = appointmentsByStatus.find(s => s.status === 'CANCELLED')?._count.status || 0;
+      const completedCount = appointmentsByStatus.find(s => s.status === 'COMPLETED')?._count.status || 0;
+
       let comparison = null;
       if (compareWith) {
         const compareStartDate = new Date(startDate);
         const compareEndDate = new Date(endDate);
-        
-        // Ajustar fechas de comparación según el período
         const diff = endDate - startDate;
+        
         compareEndDate.setTime(startDate.getTime());
         compareStartDate.setTime(startDate.getTime() - diff);
-        
+
         const compareWhere = {
           ...where,
           date: { gte: compareStartDate, lte: compareEndDate }
         };
-        
+
         const [compareTotal, compareRevenue] = await Promise.all([
           prisma.appointment.count({ where: compareWhere }),
           prisma.appointment.aggregate({
@@ -1347,9 +1218,10 @@ export const appointmentController = {
             _sum: { finalPrice: true }
           })
         ]);
-        
-        const currentRevenue = appointmentsByService.reduce((sum, service) => sum + service.revenue, 0);
-        
+
+        const currentRevenue = topServices.reduce((sum, service) => sum + service.revenue, 0);
+        const previousRevenue = compareRevenue._sum.finalPrice || 0;
+
         comparison = {
           period: compareWith,
           appointments: {
@@ -1359,9 +1231,8 @@ export const appointmentController = {
           },
           revenue: {
             current: currentRevenue,
-            previous: compareRevenue._sum.finalPrice || 0,
-            change: compareRevenue._sum.finalPrice > 0 ? 
-              (((currentRevenue - compareRevenue._sum.finalPrice) / compareRevenue._sum.finalPrice) * 100).toFixed(1) : 0
+            previous: previousRevenue,
+            change: previousRevenue > 0 ? (((currentRevenue - previousRevenue) / previousRevenue) * 100).toFixed(1) : 0
           }
         };
       }
@@ -1375,11 +1246,11 @@ export const appointmentController = {
             acc[item.status] = item._count.status;
             return acc;
           }, {}),
-          topServices: appointmentsByService.slice(0, 5),
+          topServices,
           metrics: {
-            cancelationRate: parseFloat(cancelationRate),
-            completionRate: appointmentsByStatus.find(s => s.status === 'COMPLETED')?._count.status || 0,
-            totalRevenue: appointmentsByService.reduce((sum, service) => sum + service.revenue, 0)
+            cancelationRate: totalAppointments > 0 ? (cancelledCount / totalAppointments * 100).toFixed(1) : 0,
+            completionRate: completedCount,
+            totalRevenue: topServices.reduce((sum, service) => sum + service.revenue, 0)
           },
           comparison
         }
@@ -1394,13 +1265,13 @@ export const appointmentController = {
     }
   },
 
-  // Confirmar cita (para staff)
   confirm: async (req, res) => {
     try {
       const { id } = req.params;
-      
+
       const appointment = await prisma.appointment.findUnique({
-        where: { id }
+        where: { id },
+        select: { id: true, status: true }
       });
 
       if (!appointment) {
@@ -1420,19 +1291,16 @@ export const appointmentController = {
       const confirmedAppointment = await prisma.appointment.update({
         where: { id },
         data: { status: 'CONFIRMED' },
-        include: {
-          service: true,
-          user: true,
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
-      // Enviar notificación de confirmación
-      try {
-        await notificationService.sendAppointmentConfirmation(confirmedAppointment);
-      } catch (notificationError) {
-        logger.warn('Error enviando notificación de confirmación:', notificationError);
-      }
+      notificationService.sendAppointmentConfirmation(confirmedAppointment)
+        .catch(err => logger.warn('Error enviando notificación de confirmación:', err));
 
       res.json({
         success: true,
@@ -1449,14 +1317,14 @@ export const appointmentController = {
     }
   },
 
-  // Completar cita (para staff)
   complete: async (req, res) => {
     try {
       const { id } = req.params;
       const { notes } = req.body;
-      
+
       const appointment = await prisma.appointment.findUnique({
-        where: { id }
+        where: { id },
+        select: { id: true, status: true, notes: true }
       });
 
       if (!appointment) {
@@ -1475,15 +1343,16 @@ export const appointmentController = {
 
       const completedAppointment = await prisma.appointment.update({
         where: { id },
-        data: { 
+        data: {
           status: 'COMPLETED',
           notes: notes || appointment.notes,
           completedAt: new Date()
         },
-        include: {
-          service: true,
-          user: true,
-          clinic: true
+        select: {
+          ...APPOINTMENT_BASE_SELECT,
+          service: { select: SERVICE_SELECT },
+          user: { select: USER_SELECT },
+          clinic: { select: CLINIC_SELECT }
         }
       });
 
@@ -1504,22 +1373,24 @@ export const appointmentController = {
     }
   },
 
-  // ===============================
-  // MÉTODOS ADICIONALES PARA PRODUCCIÓN
-  // ===============================
-
-  // 📊 Obtener historial de cambios de una cita
   getHistory: async (req, res) => {
     try {
       const { id } = req.params;
-      const userId = req.userId;
-      const userRole = req.userRole;
+      const { userId, userRole } = req;
 
-      // Verificar que la cita existe y el usuario tiene permisos
       const appointment = await prisma.appointment.findFirst({
         where: {
           id,
           ...(userRole === 'CLIENTE' ? { userId } : {})
+        },
+        select: {
+          id: true,
+          status: true,
+          createdAt: true,
+          updatedAt: true,
+          cancelledAt: true,
+          completedAt: true,
+          cancelReason: true
         }
       });
 
@@ -1530,16 +1401,12 @@ export const appointmentController = {
         });
       }
 
-      // En una implementación real, tendrías una tabla de historial
-      // Por ahora, devolvemos información básica
-      const history = [
-        {
-          action: 'CREATED',
-          timestamp: appointment.createdAt,
-          details: 'Cita creada',
-          user: 'Sistema'
-        }
-      ];
+      const history = [{
+        action: 'CREATED',
+        timestamp: appointment.createdAt,
+        details: 'Cita creada',
+        user: 'Sistema'
+      }];
 
       if (appointment.status === 'CANCELLED') {
         history.push({
@@ -1576,16 +1443,16 @@ export const appointmentController = {
     }
   },
 
-  // 📱 Generar enlace de videollamada (placeholder)
   generateVideoLink: async (req, res) => {
     try {
       const { id } = req.params;
-      
+
       const appointment = await prisma.appointment.findUnique({
         where: { id },
-        include: {
-          service: true,
-          user: true
+        select: {
+          id: true,
+          service: { select: { name: true } },
+          user: { select: { name: true } }
         }
       });
 
@@ -1596,14 +1463,13 @@ export const appointmentController = {
         });
       }
 
-      // En una implementación real, integrarías con Zoom, Teams, etc.
       const videoLink = `https://meet.clinica.com/room/${id}`;
-      
+
       res.json({
         success: true,
         data: {
           videoLink,
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 horas
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
           instructions: 'El enlace estará disponible 15 minutos antes de la cita'
         }
       });
@@ -1617,56 +1483,23 @@ export const appointmentController = {
     }
   },
 
-  // 📄 Exportar citas (placeholder)
   export: async (req, res) => {
     try {
       const { format = 'pdf', ...filters } = req.query;
-      const userId = req.userId;
-      const userRole = req.userRole;
-      const clinicId = req.clinicId;
+      const { userId, userRole, clinicId } = req;
 
-      // Construir filtros para la consulta
-      const where = {};
-      
-      if (userRole === 'CLIENTE') {
-        where.userId = userId;
-      } else if (clinicId) {
-        where.clinicId = clinicId;
-      }
-
-      // Aplicar filtros adicionales
-      if (filters.dateFrom) {
-        where.date = { ...where.date, gte: new Date(filters.dateFrom) };
-      }
-      if (filters.dateTo) {
-        where.date = { ...where.date, lte: new Date(filters.dateTo) };
-      }
-      if (filters.status) {
-        where.status = filters.status;
-      }
-
-      const appointments = await prisma.appointment.findMany({
-        where,
-        include: {
-          service: true,
-          user: {
-            select: {
-              name: true,
-              email: true,
-              phone: true
-            }
-          },
-          clinic: true
-        },
-        orderBy: { date: 'desc' }
+      const where = buildAppointmentWhere({
+        ...(userRole === 'CLIENTE' ? { userId } : { clinicId }),
+        ...filters
       });
 
-      // En una implementación real, generarías el archivo PDF/Excel
+      const appointmentCount = await prisma.appointment.count({ where });
+
       res.json({
         success: true,
         data: {
           downloadUrl: `/api/exports/appointments-${Date.now()}.${format}`,
-          appointments: appointments.length,
+          appointments: appointmentCount,
           format,
           generatedAt: new Date()
         }
@@ -1681,11 +1514,10 @@ export const appointmentController = {
     }
   },
 
-  // 🚀 Método de prueba para verificar endpoints
   test: async (req, res) => {
     try {
       const { endpoint } = req.params;
-      
+
       const tests = {
         'create': 'POST /appointments - Crear cita',
         'list': 'GET /appointments - Listar citas',
